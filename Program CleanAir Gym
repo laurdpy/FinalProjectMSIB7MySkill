@@ -1,0 +1,223 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+#define pinSen 34
+#define R 17
+#define G 16
+#define B 4
+#define buzz 5
+#define relay 19
+
+const float Rload = 10.0;
+const float a = 110.47;
+const float b = -2.862;
+float mppm = 7000, Ro = 10.25;
+
+int adc, ppm;
+float Vout, RS, ratio, Konsen;
+float Vcc = 5;
+
+enum AirQuality {
+  BAIK,
+  RATA_RATA,
+  KURANG_BAIK,
+  BAHAYA
+};
+AirQuality State;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const char* ssid = "JUWITA";                        
+const char* password = "parangbaris";              
+const char* thingsboardUrl = "http://demo.thingsboard.io/api/v1/sensormq135/telemetry"; 
+const char* telegramBotToken = "7897611044:AAGf4eVubmHK_tL98yVizh5feqMLo7itMO8";  
+const char* chatID = "1277124604";              
+
+void connectToWiFi() {
+  lcd.setCursor(0, 0);
+  lcd.print("Connect to WiFi...");
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) { 
+    delay(500);
+    lcd.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.setCursor(0, 1);
+    lcd.print("Connected");
+  } else {
+    lcd.setCursor(0, 1);
+    ESP.restart(); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  lcd.begin(16, 2);
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Init System");
+  delay(500);
+  connectToWiFi();
+  delay(2000);
+  lcd.clear();
+
+  pinMode(pinSen, INPUT);
+  pinMode(R, OUTPUT);
+  pinMode(G, OUTPUT);
+  pinMode(B, OUTPUT);
+  pinMode(buzz, OUTPUT);
+  pinMode(relay, OUTPUT);
+
+  digitalWrite(R, LOW);
+  digitalWrite(G, LOW);
+  digitalWrite(B, LOW);
+  digitalWrite(buzz, LOW);
+  digitalWrite(relay, LOW);
+}
+
+void loop() {
+  adc = analogRead(pinSen);
+  Vout = (adc / 4095.0) * Vcc;
+  RS = ((Vcc - Vout) / Vout) * Rload;
+  ratio = RS / Ro;
+  ppm = (a * pow(ratio, b) / 10) + 400;
+  Konsen = (ppm / mppm) * 100;
+
+  updateState();
+  sendToThingsBoard(ppm, Konsen);
+  control();
+}
+
+void setRGB(int r, int g, int b) {
+  digitalWrite(R, r);
+  digitalWrite(G, g);
+  digitalWrite(B, b);
+}
+
+void updateState() {
+  Serial.println("----------------- ");
+  Serial.print("ADC : ");
+  Serial.print(adc);
+  Serial.print(" | V : ");
+  Serial.print(Vout);
+  Serial.print(" | RS : ");
+  Serial.print(RS);
+  Serial.print(" | PPM : ");
+  Serial.print(ppm);
+  Serial.print(" ppm");
+  Serial.print(" | CO2 : ");
+  Serial.print(Konsen);
+  Serial.println(" %");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("PPM : ");
+  lcd.print(ppm);
+  lcd.print(" ppm");
+  lcd.setCursor(0, 1);
+  lcd.print("CO2 : ");
+  lcd.print(Konsen);
+  lcd.print(" %");
+
+  delay(2000);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Kualitas Udara: ");
+  lcd.setCursor(0, 1);
+
+  if (ppm >= 400 && ppm <= 1000) {
+    State = BAIK;
+    control_relay();
+  } else if (ppm > 1000 && ppm <= 1300) {
+    State = RATA_RATA;
+    control_relay(); 
+  } else if (ppm > 1300 && ppm <= 2000) {
+    State = KURANG_BAIK;
+    control_relay();
+  } else if (ppm > 2000) {
+    State = BAHAYA;
+    control_relay();
+  }
+}
+
+void control_relay(){
+  if(State !=BAHAYA) {
+    digitalWrite(relay, HIGH);
+    delay(100); 
+  }else{
+    digitalWrite(relay, LOW);
+    delay(100);
+  }
+}
+
+void control() {
+  String message;
+  switch (State) {
+    case BAIK:
+      lcd.print("Baik");
+      setRGB(0, 0, 1);
+      message = "Kualitas Udara Baik 😊";
+      break;
+
+    case RATA_RATA:
+      lcd.print("Rata - Rata");
+      setRGB(0, 1, 0);
+      message = "Kualitas Udara Rata-Rata 😐";
+      break;
+
+    case KURANG_BAIK:
+      lcd.print("Kurang Baik");
+      setRGB(1, 1, 0);
+      message = "Kualitas Udara Kurang Baik 😷";
+      break;
+
+    case BAHAYA:
+      lcd.print("Bahaya");
+      setRGB(1, 0, 0);
+      tone(buzz, 3000, 200);
+      message = "Kualitas Udara Bahaya! Evakuasi Segera 😱";
+      break;
+  }
+  sendMessageToTelegram(message);
+}
+
+
+void sendToThingsBoard(int ppm, float konsen) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(thingsboardUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{";
+    payload += "\"ppm\":" + String(ppm) + ",";
+    payload += "\"CO2\":" + String(konsen);
+    payload += "}";
+
+    int httpResponseCode = http.POST(payload);
+
+    if (httpResponseCode <= 0) {
+      Serial.println("Failed to send data.");
+    }
+    http.end();
+  }
+}
+
+void sendMessageToTelegram(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String("https://api.telegram.org/bot") + telegramBotToken + "/sendMessage?chat_id=" + chatID + "&text=" + message;
+    http.begin(url);
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode <= 0) {
+      Serial.println("Failed to send notification.");
+    }
+    http.end();
+  }
+}
